@@ -1,0 +1,183 @@
+#!groovy
+
+pipeline {
+
+  agent any
+
+  parameters {
+    string(
+      name: 'AWS_CREDENTIALS_ID',
+      defaultValue: '',
+      description: 'AWS credentials id, stored in Jenkins credentials'
+    )
+    string(
+      name: 'COFIG_FILE_NAME',
+      defaultValue: '',
+      description: 'File name of Packer configuration file'
+    )
+    string(
+      name: 'EXTRA_ARGS',
+      defaultValue: '',
+      description: 'packer build command extra arguments'
+    )
+    string(
+      name: 'GIT_BRANCHES_CONFG',
+      defaultValue: '*/master',
+      description: "Git branch or tag name or commit id to retrieve of GIT_URL of Ansible playbooks"
+    )
+    string(
+      name: 'GIT_URL_CONFIG',
+      defaultValue: '',
+      description: "GitHub URL of ansible.cfg"
+    )
+    string(
+      name: 'REGION',
+      defaultValue: '',
+      description: 'AWS CLI region name'
+    )
+    string(
+      name: 'WORKING_DIR',
+      defaultValue: 'packer',
+      description: 'Job working directory'
+    )
+  }
+
+  stages {
+    stage('Retrieve Packer config files') {
+      steps {
+        checkout(
+          [
+            $class: 'GitSCM',
+            branches: [
+              [
+                name: "${params.GIT_BRANCHES_CONFIG}"
+              ]
+            ],
+            extensions: [
+              [
+                $class: 'RelativeTargetDirectory',
+                relativeTargetDir: "${params.WORKING_DIR}"
+              ]
+            ],
+            doGenerateSubmoduleConfigurations: false,
+            submoduleCfg: [],
+            userRemoteConfigs: [
+              [
+                url: "${params.GIT_URL_CONFIG}"
+              ]
+            ]
+          ]
+        )
+      }
+    }
+
+    stage('Set AWS credentials') {
+      steps {
+        dir ("${params.WORKING_DIR}") {
+          withAWS(credentials:"${params.AWS_CREDENTIALS_ID}", region:"${params.REGION}") {
+            
+          }
+        }
+      }
+    }
+
+    stage('Install galaxy roles') {
+      steps {
+        dir ("${params.WORKING_DIR}") {
+          script {
+            def file_exists = fileExists('roles/requirements.yml')
+
+            if (file_exists) {
+              sh "ansible-galaxy install -r roles/requirements.yml -p roles/"
+            } else {
+              sh "echo 'No Ansible Galaxy roles to be installed found'"
+            }
+          }
+        }
+      }
+    }
+
+    stage('Set SSH Private Key') {
+      steps {
+        dir ("${params.WORKING_DIR}") {
+          script {
+            def private_key = sh(
+                            returnStdout: true,
+                            script: "echo ${params.SSH_PRIVATE_KEY}"
+                         )
+             
+            if ( private_key.trim().length() != 0 ) {
+              withCredentials(
+                bindings: 
+                  [
+                    sshUserPrivateKey
+                      (
+                         credentialsId: "${params.SSH_PRIVATE_KEY}", \
+                         keyFileVariable: 'PRIVATE_KEY'
+                      )
+                  ]
+              ) 
+              {
+                sh "cat $PRIVATE_KEY > .private_key.pem"
+                sh "chmod 600 .private_key.pem"
+              }
+            } else {
+              sh "echo 'No private key id provided'"
+            }
+          }
+        }
+      }
+    }
+
+    stage('Execute ansible-playbook') {
+      steps {
+        dir ("${params.WORKING_DIR}") {
+          script {
+            def private_key = sh(
+                            returnStdout: true,
+                            script: "echo ${params.SSH_PRIVATE_KEY}"
+                         )
+
+            if ( private_key.trim().length() != 0 ) {
+              sh "ansible-playbook ${params.ANSIBLE_PLAYBOOK} \
+                  ${params.INVENTORY_PARAMS} \
+                  --key-file '.private_key.pem' \
+                  ${params.EXTRA_ARGS} \
+                  | tee ansible.log"
+            } else {
+              sh "ansible-playbook ${params.ANSIBLE_PLAYBOOK} \
+                  ${params.INVENTORY_PARAMS} \
+                  ${params.EXTRA_ARGS} \
+                  | tee ansible.log"
+            }
+          }
+        }
+      }
+    }
+
+    stage('Analyze results') {
+      steps {
+        dir ("${params.WORKING_DIR}") {
+          script {
+            def output = sh(
+                            returnStdout: true,
+                            script: "tail -n 2 ansible.log"
+                         )
+
+            if (output.contains("unreachable=0") && output.contains("failed=0")) {
+              sh "echo success"
+            } else {
+              error "ansible-playbook error\n$output"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      cleanWs()
+    }
+  }
+}
